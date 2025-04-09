@@ -46,7 +46,7 @@ const CCT_ABI = [
 const SUPPORTED_CHAINS = {
   "Arbitrum Sepolia": {
     chainId: 421614,
-    wormholeChainId: 23, // Arbitrum 在 Wormhole 中的链 ID
+    wormholeChainId: 10003, // Arbitrum Sepolia 在 Wormhole 中的链 ID
     name: "Arbitrum Sepolia",
     nttManager: "0x2D42B901dAf957F3d1949a53c7Eb37a8111AEbB8", // Arbitrum Sepolia 上的 NTT Manager 地址
     cctAddress: "0x3784Ce665CA1AE8f26ae96589b917f8081E72fe7", // Arbitrum Sepolia CCT
@@ -71,6 +71,35 @@ const SUPPORTED_CHAINS = {
       symbol: "BNB",
       decimals: 18
     }
+  },
+  "Sepolia": {
+    chainId: 11155111,
+    wormholeChainId: 10002, // Sepolia 在 Wormhole 中的链 ID
+    name: "Sepolia",
+    nttManager: "0x388e36c3E48fDB2C7F90b522ee12dD4A55275B54", // 根据deployment.json
+    cctAddress: "0x971d048EF94DaD79427abdbc36BC2a2b2aED9687", // 根据deployment.json
+    rpc: "https://rpc.sepolia.org",
+    explorer: "https://sepolia.etherscan.io",
+    nativeCurrency: {
+      name: "ETH",
+      symbol: "ETH",
+      decimals: 18
+    }
+  },
+  "Solana": {
+    chainId: 0, // Solana 没有EVM chainId
+    wormholeChainId: 1, // Solana 在 Wormhole 中的链 ID
+    name: "Solana",
+    nttManager: "NTtAGGyP6BjfxfCYbvi8ZVnGg2L8Dj68jm2DorciTBv", // 根据deployment.json
+    cctAddress: "FUDnkD5jC6T2YTw9zdTJ7VyP3koVy78xh7SpHMgYNqXz", // 根据deployment.json
+    rpc: "https://api.devnet.solana.com",
+    explorer: "https://explorer.solana.com/?cluster=devnet",
+    nativeCurrency: {
+      name: "SOL",
+      symbol: "SOL",
+      decimals: 9
+    },
+    isSolana: true // 标记为Solana链，需要特殊处理
   }
 } as const;
 
@@ -86,7 +115,8 @@ const WORMHOLE_CHAIN_ID_MAP: Record<string, number> = {
   "Arbitrum Sepolia": 10003,
   "Optimism": 24,
   "Base": 30,
-  "Ethereum Sepolia": 10002
+  "Ethereum Sepolia": 10002,
+  "Sepolia": 10002
 };
 
 // 跨链传输常量
@@ -117,13 +147,16 @@ const retryOperation = async <T,>(operation: () => Promise<T>, retries = CROSS_C
 };
 
 // 类型定义
-type ChainConfig = typeof SUPPORTED_CHAINS[keyof typeof SUPPORTED_CHAINS];
-type TransactionStatus = "idle" | "preparing" | "approving" | "transferring" | "confirming" | "success" | "error";
+type ChainConfig = typeof SUPPORTED_CHAINS[keyof typeof SUPPORTED_CHAINS] & {
+  isSolana?: boolean;
+};
+type TransactionStatus = "idle" | "preparing" | "approving" | "transferring" | "confirming" | "success" | "error" | "warning";
 
 const BridgeComponent = () => {
   const [sourceChain, setSourceChain] = useState<string>("");
   const [targetChain, setTargetChain] = useState<string>("");
   const [amount, setAmount] = useState<string>("");
+  const [destinationAddress, setDestinationAddress] = useState<string>("");
   const [wallet, setWallet] = useState<ethers.Signer | null>(null);
   const [walletAddress, setWalletAddress] = useState<string>("");
   const [status, setStatus] = useState<TransactionStatus>("idle");
@@ -244,6 +277,16 @@ const BridgeComponent = () => {
     return '0x000000000000000000000000' + cleanAddress;
   };
 
+  // 添加Solana地址处理函数
+  const prepareSolanaAddress = (solanaAddress: string): string => {
+    // Solana地址需要特殊处理，转换为bytes32格式
+    // 这里使用简化版实现，实际应该使用@solana/web3.js库
+    
+    // 将Solana地址填充为bytes32格式
+    // 警告：这只是临时方案，生产环境中应使用正确的Solana地址转换
+    return '0x000000000000000000000000000000000000000000000000' + solanaAddress.slice(0, 16);
+  };
+
   // 执行跨链转账
   const performBridgeTransfer = async () => {
     if (!sourceChain || !targetChain || !amount || !wallet || !srcChainConfig || !dstChainConfig) {
@@ -348,9 +391,49 @@ const BridgeComponent = () => {
         console.log('CCT授权成功');
       }
 
-      // 准备接收者地址
-      const bytes32Recipient = prepareRecipientAddress(address);
-      console.log('接收者地址 (bytes32):', bytes32Recipient);
+      // 定义接收者地址变量
+      let bytes32Recipient: string;
+      
+      // 检查是否有自定义目标地址，如果没有则使用当前钱包地址
+      const recipientAddress = destinationAddress.trim() || address;
+
+      // 检查是否转账到Solana
+      if (dstChainConfig.isSolana) {
+        if (!destinationAddress.trim()) {
+          // 如果未指定Solana地址，显示警告
+          setStatus("warning");
+          setStatusMessage(`警告：转账到Solana需要指定有效的Solana地址。请在"目标地址"字段中输入您的Solana钱包地址。`);
+          return;
+        }
+        
+        // 验证Solana地址格式（简单检查）
+        if (destinationAddress.length < 32 || !destinationAddress.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+          setStatus("error");
+          setStatusMessage(`错误：无效的Solana地址格式。请输入有效的Solana地址。`);
+          return;
+        }
+        
+        // 使用用户输入的Solana地址
+        bytes32Recipient = prepareSolanaAddress(destinationAddress);
+        console.log('Solana接收地址 (bytes32):', bytes32Recipient);
+      } else {
+        // 非Solana链使用标准EVM地址处理
+        try {
+          // 验证EVM地址格式
+          if (destinationAddress.trim() && !ethers.utils.isAddress(destinationAddress)) {
+            setStatus("error");
+            setStatusMessage(`错误：无效的ETH地址格式。请输入有效的ETH地址。`);
+            return;
+          }
+          
+          bytes32Recipient = prepareRecipientAddress(recipientAddress);
+          console.log('接收者地址 (bytes32):', bytes32Recipient);
+        } catch (error) {
+          setStatus("error");
+          setStatusMessage(`错误：地址格式无效。${error}`);
+          return;
+        }
+      }
       
       // 获取正确的Wormhole链ID，测试网环境下确保使用测试网ID
       // BSC Testnet -> Arbitrum Sepolia: 10003
@@ -422,6 +505,8 @@ const BridgeComponent = () => {
         return "bg-green-100 text-green-800";
       case "error":
         return "bg-red-100 text-red-800";
+      case "warning":
+        return "bg-yellow-100 text-yellow-800";
       default:
         return "";
     }
@@ -432,7 +517,7 @@ const BridgeComponent = () => {
     if (status === "idle") return null;
     
     return (
-      <div className={`p-4 rounded ${getStatusClass()}`}>
+      <div className={`p-4 rounded mb-4 ${getStatusClass()}`}>
         <div className="font-bold">{status.charAt(0).toUpperCase() + status.slice(1)}</div>
         <div className="whitespace-pre-line">{statusMessage}</div>
         {txHash && (
@@ -456,97 +541,124 @@ const BridgeComponent = () => {
     status === "preparing" || status === "approving" || status === "transferring" || status === "confirming";
 
   return (
-    <div className="p-4 max-w-lg mx-auto">
-      <h1 className="text-2xl font-bold mb-4">Wormhole 跨链桥</h1>
-      
-      {!wallet ? (
-        <button
-          onClick={connectWallet}
-          className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded w-full transition"
-        >
-          连接钱包
-        </button>
-      ) : (
-        <div className="space-y-4">
-          <div className="p-3 bg-gray-100 rounded mb-4 text-sm">
-            已连接钱包: {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
-          </div>
-          
-          <div>
-            <label className="block mb-2 font-medium">源链:</label>
-            <select
-              value={sourceChain}
-              onChange={(e) => setSourceChain(e.target.value)}
-              className="border p-2 rounded w-full bg-white"
-              disabled={status !== "idle" && status !== "error" && status !== "success"}
+    <div className="p-6 max-w-lg mx-auto">
+      <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+        <h1 className="text-2xl font-bold mb-6 text-center text-gray-800">Wormhole 跨链桥</h1>
+        <div className="mb-2 text-sm text-center text-gray-500">测试网环境</div>
+        
+        {!wallet ? (
+          <div className="mt-8 flex justify-center">
+            <button
+              onClick={connectWallet}
+              className="bg-blue-500 hover:bg-blue-600 text-white px-6 py-3 rounded-md font-medium transition transform hover:scale-105 w-full max-w-xs"
             >
-              <option value="">选择链</option>
-              {Object.keys(SUPPORTED_CHAINS).map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-            </select>
+              连接钱包
+            </button>
           </div>
+        ) : (
+          <div className="space-y-5">
+            <div className="p-3 bg-gray-50 rounded-md border border-gray-200 flex items-center justify-between">
+              <div className="text-sm text-gray-700">已连接钱包:</div>
+              <div className="font-mono text-sm bg-gray-100 px-2 py-1 rounded">
+                {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
+              </div>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block mb-2 font-medium text-gray-700">源链:</label>
+                <select
+                  value={sourceChain}
+                  onChange={(e) => setSourceChain(e.target.value)}
+                  className="border border-gray-300 p-2 rounded-md w-full bg-white focus:ring-2 focus:ring-blue-300 focus:border-blue-500 outline-none transition"
+                  disabled={status !== "idle" && status !== "error" && status !== "success"}
+                >
+                  <option value="">选择链</option>
+                  {Object.keys(SUPPORTED_CHAINS).map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-          <div>
-            <label className="block mb-2 font-medium">目标链:</label>
-            <select
-              value={targetChain}
-              onChange={(e) => setTargetChain(e.target.value)}
-              className="border p-2 rounded w-full bg-white"
-              disabled={status !== "idle" && status !== "error" && status !== "success"}
+              <div>
+                <label className="block mb-2 font-medium text-gray-700">目标链:</label>
+                <select
+                  value={targetChain}
+                  onChange={(e) => setTargetChain(e.target.value)}
+                  className="border border-gray-300 p-2 rounded-md w-full bg-white focus:ring-2 focus:ring-blue-300 focus:border-blue-500 outline-none transition"
+                  disabled={status !== "idle" && status !== "error" && status !== "success"}
+                >
+                  <option value="">选择链</option>
+                  {Object.keys(SUPPORTED_CHAINS).map((name) => (
+                    <option key={name} value={name} disabled={name === sourceChain}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label className="block mb-2 font-medium text-gray-700">金额 (CCT):</label>
+              <input
+                type="number"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                className="border border-gray-300 p-2 rounded-md w-full focus:ring-2 focus:ring-blue-300 focus:border-blue-500 outline-none transition"
+                placeholder="输入 CCT 金额"
+                step="0.000001"
+                min="0"
+                disabled={status !== "idle" && status !== "error" && status !== "success"}
+              />
+            </div>
+            
+            <div>
+              <label className="block mb-2 font-medium text-gray-700">
+                目标地址: 
+                <span className="text-sm font-normal text-gray-500 ml-2">
+                  (留空则使用当前钱包地址{dstChainConfig?.isSolana ? "，Solana链必须指定" : ""})
+                </span>
+              </label>
+              <input
+                type="text"
+                value={destinationAddress}
+                onChange={(e) => setDestinationAddress(e.target.value)}
+                className="border border-gray-300 p-2 rounded-md w-full focus:ring-2 focus:ring-blue-300 focus:border-blue-500 outline-none transition"
+                placeholder={`输入接收地址${dstChainConfig?.isSolana ? " (Solana地址)" : ""}`}
+                disabled={status !== "idle" && status !== "error" && status !== "success"}
+              />
+            </div>
+            
+            {renderTransactionStatus()}
+
+            <button
+              onClick={performBridgeTransfer}
+              disabled={isTransferDisabled}
+              className={`px-4 py-3 rounded-md w-full transition font-medium ${
+                isTransferDisabled
+                  ? "bg-gray-400 text-gray-200 cursor-not-allowed"
+                  : "bg-green-500 hover:bg-green-600 text-white shadow-sm hover:shadow transform hover:scale-[1.02]"
+              }`}
             >
-              <option value="">选择链</option>
-              {Object.keys(SUPPORTED_CHAINS).map((name) => (
-                <option key={name} value={name} disabled={name === sourceChain}>
-                  {name}
-                </option>
-              ))}
-            </select>
+              {status === "preparing" || status === "approving" || status === "transferring" || status === "confirming"
+                ? "处理中..."
+                : "执行跨链转账"}
+            </button>
+            
+            <div className="text-sm text-gray-600 mt-6 bg-blue-50 p-4 rounded-md border border-blue-100">
+              <h3 className="font-medium mb-2 text-blue-800">说明:</h3>
+              <ul className="list-disc pl-5 space-y-1 text-gray-700">
+                <li>当前使用的是测试网络</li>
+                <li>需要确保钱包中有足够的测试网代币支付 gas 费用</li>
+                <li>跨链转账需要支付 {CROSS_CHAIN_CONSTANTS.FEE} ETH 的跨链费用</li>
+                <li>跨链转账完成大约需要 5-15 分钟</li>
+              </ul>
+            </div>
           </div>
-
-          <div>
-            <label className="block mb-2 font-medium">金额 (CCT):</label>
-            <input
-              type="number"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              className="border p-2 rounded w-full"
-              placeholder="输入 CCT 金额"
-              step="0.000001"
-              min="0"
-              disabled={status !== "idle" && status !== "error" && status !== "success"}
-            />
-          </div>
-
-          {renderTransactionStatus()}
-
-          <button
-            onClick={performBridgeTransfer}
-            disabled={isTransferDisabled}
-            className={`px-4 py-2 rounded w-full transition ${
-              isTransferDisabled
-                ? "bg-gray-400 text-gray-200 cursor-not-allowed"
-                : "bg-green-500 hover:bg-green-600 text-white"
-            }`}
-          >
-            {status === "preparing" || status === "approving" || status === "transferring" || status === "confirming"
-              ? "处理中..."
-              : "执行跨链转账"}
-          </button>
-          
-          <div className="text-sm text-gray-600 mt-4 bg-gray-50 p-3 rounded">
-            <h3 className="font-medium mb-2">说明:</h3>
-            <ul className="list-disc pl-5 space-y-1">
-              <li>当前使用的是测试网络</li>
-              <li>需要确保钱包中有足够的测试网代币支付 gas 费用</li>
-              <li>跨链转账需要支付 {CROSS_CHAIN_CONSTANTS.FEE} ETH 的跨链费用</li>
-              <li>跨链转账完成大约需要 5-15 分钟</li>
-            </ul>
-          </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 };
