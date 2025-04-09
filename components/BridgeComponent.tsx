@@ -1,40 +1,19 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ethers } from 'ethers';
 import { MetaMaskInpageProvider } from "@metamask/providers";
 
-// NTT Manager ABI
+// NTT Manager ABI - 只保留使用的部分
 const NTT_MANAGER_ABI = [
   {
     "inputs": [
       {"type": "uint256", "name": "amount"},
       {"type": "uint16", "name": "recipientChain"},
-      {"type": "bytes32", "name": "recipient"}
+      {"type": "bytes32", "name": "recipient"},
+      {"type": "bytes32", "name": "refundAddress"},
+      {"type": "bool", "name": "shouldQueue"},
+      {"type": "bytes", "name": "transceiverInstructions"}
     ],
-    "name": "sendTokens",
-    "outputs": [],
-    "stateMutability": "payable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {"type": "address", "name": "token"}, 
-      {"type": "uint256", "name": "amount"}, 
-      {"type": "uint16", "name": "recipientChain"}, 
-      {"type": "bytes32", "name": "recipient"}
-    ],
-    "name": "transferTokensWithRelay",
-    "outputs": [],
-    "stateMutability": "payable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {"type": "address", "name": "token"}, 
-      {"type": "uint256", "name": "amount"}, 
-      {"type": "uint16", "name": "recipientChain"}, 
-      {"type": "bytes32", "name": "recipient"}
-    ],
-    "name": "transferTokens",
+    "name": "transfer",
     "outputs": [],
     "stateMutability": "payable",
     "type": "function"
@@ -55,12 +34,12 @@ const NTT_MANAGER_ABI = [
   }
 ];
 
-// USDC ABI
-const USDC_ABI = [
-  "function approve(address spender, uint256 amount) external returns (bool)",
-  "function allowance(address owner, address spender) external view returns (uint256)",
-  "function balanceOf(address account) external view returns (uint256)",
-  "function decimals() external view returns (uint8)"
+// 最小化CCT ABI - 只包含需要的函数
+const CCT_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function allowance(address, address) view returns (uint256)",
+  "function approve(address, uint256) returns (boolean)"
 ];
 
 // 支持的链配置
@@ -70,7 +49,7 @@ const SUPPORTED_CHAINS = {
     wormholeChainId: 23, // Arbitrum 在 Wormhole 中的链 ID
     name: "Arbitrum Sepolia",
     nttManager: "0x2D42B901dAf957F3d1949a53c7Eb37a8111AEbB8", // Arbitrum Sepolia 上的 NTT Manager 地址
-    usdcAddress: "0x3784Ce665CA1AE8f26ae96589b917f8081E72fe7", // Arbitrum Sepolia USDC
+    cctAddress: "0x3784Ce665CA1AE8f26ae96589b917f8081E72fe7", // Arbitrum Sepolia CCT
     rpc: "https://sepolia-rollup.arbitrum.io/rpc",
     explorer: "https://sepolia.arbiscan.io",
     nativeCurrency: {
@@ -84,7 +63,7 @@ const SUPPORTED_CHAINS = {
     wormholeChainId: 4, // BSC 在 Wormhole 中的链 ID
     name: "BSC Testnet",
     nttManager: "0x8290988FaBBCFF19737aa72d79680e659207368e", // BSC 测试网上的 NTT Manager 地址
-    usdcAddress: "0x6B4d90B36Fd734863d8937140546251db069839b", // BSC Testnet USDC
+    cctAddress: "0x6B4d90B36Fd734863d8937140546251db069839b", // BSC Testnet CCT
     rpc: "https://bsc-testnet-rpc.publicnode.com",
     explorer: "https://testnet.bscscan.com",
     nativeCurrency: {
@@ -95,21 +74,38 @@ const SUPPORTED_CHAINS = {
   }
 } as const;
 
+// Wormhole链ID映射 - 根据官方文档
+const WORMHOLE_CHAIN_ID_MAP: Record<string, number> = {
+  "Ethereum": 2,
+  "Solana": 1,
+  "BNB Smart Chain": 4,
+  "BSC Testnet": 4,
+  "Avalanche": 6,
+  "Polygon": 5,
+  "Arbitrum": 23,
+  "Arbitrum Sepolia": 10003,
+  "Optimism": 24,
+  "Base": 30,
+  "Ethereum Sepolia": 10002
+};
+
+// 跨链传输常量
+const CROSS_CHAIN_CONSTANTS = {
+  FEE: "0.005", // 跨链费用 (ETH)
+  GAS_LIMIT: 900000, // Gas限制
+  FUNCTION_SELECTOR: "0xb293f97f", // transfer函数选择器
+  TX_RETRY_COUNT: 3, // 重试次数
+  TX_TIMEOUT: 30000, // 超时时间(ms)
+};
+
 declare global {
   interface Window {
     ethereum?: MetaMaskInpageProvider;
   }
 }
 
-// 添加 RPC 配置
-const RPC_CONFIG = {
-  retry: 3,
-  timeout: 30000,
-  gasBuffer: 1.2  // 20% 的 gas 缓冲
-};
-
 // 添加重试函数
-const retryOperation = async (operation: () => Promise<any>, retries = RPC_CONFIG.retry) => {
+const retryOperation = async <T,>(operation: () => Promise<T>, retries = CROSS_CHAIN_CONSTANTS.TX_RETRY_COUNT) => {
   try {
     return await operation();
   } catch (error) {
@@ -122,14 +118,38 @@ const retryOperation = async (operation: () => Promise<any>, retries = RPC_CONFI
   }
 };
 
+// 类型定义
+type ChainConfig = typeof SUPPORTED_CHAINS[keyof typeof SUPPORTED_CHAINS];
+type TransactionStatus = "idle" | "preparing" | "approving" | "transferring" | "confirming" | "success" | "error";
+
 const BridgeComponent = () => {
-  const [sourceChain, setSourceChain] = useState("");
-  const [targetChain, setTargetChain] = useState("");
-  const [amount, setAmount] = useState("");
+  const [sourceChain, setSourceChain] = useState<string>("");
+  const [targetChain, setTargetChain] = useState<string>("");
+  const [amount, setAmount] = useState<string>("");
   const [wallet, setWallet] = useState<ethers.Signer | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [transferStatus, setTransferStatus] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
+  const [walletAddress, setWalletAddress] = useState<string>("");
+  const [status, setStatus] = useState<TransactionStatus>("idle");
+  const [statusMessage, setStatusMessage] = useState<string>("");
+  const [txHash, setTxHash] = useState<string>("");
+  const [srcChainConfig, setSrcChainConfig] = useState<ChainConfig | null>(null);
+  const [dstChainConfig, setDstChainConfig] = useState<ChainConfig | null>(null);
+
+  // 处理源链和目标链变化
+  useEffect(() => {
+    if (sourceChain) {
+      setSrcChainConfig(SUPPORTED_CHAINS[sourceChain as keyof typeof SUPPORTED_CHAINS]);
+    } else {
+      setSrcChainConfig(null);
+    }
+  }, [sourceChain]);
+
+  useEffect(() => {
+    if (targetChain) {
+      setDstChainConfig(SUPPORTED_CHAINS[targetChain as keyof typeof SUPPORTED_CHAINS]);
+    } else {
+      setDstChainConfig(null);
+    }
+  }, [targetChain]);
 
   // 连接 MetaMask 钱包
   const connectWallet = async () => {
@@ -139,37 +159,59 @@ const BridgeComponent = () => {
         await provider.send('eth_requestAccounts', []);
         const signer = provider.getSigner();
         setWallet(signer);
+        
+        // 获取当前钱包地址
+        const address = await signer.getAddress();
+        setWalletAddress(address);
 
         // 获取当前网络信息
         const network = await provider.getNetwork();
-        console.log('Current network after connection:', network);
+        console.log('当前网络:', network);
 
         // 监听网络变化
-        window.ethereum.on('chainChanged', (chainId) => {
-          console.log('Network changed to:', chainId);
+        window.ethereum.on('chainChanged', (_chainId) => {
+          console.log('网络已切换:', _chainId);
           window.location.reload();
+        });
+
+        // 监听账户变化
+        window.ethereum.on('accountsChanged', (accounts: any) => {
+          console.log('账户已切换:', accounts);
+          if (accounts.length === 0) {
+            // 用户断开了钱包
+            setWallet(null);
+            setWalletAddress("");
+          } else {
+            // 用户切换了账户
+            window.location.reload();
+          }
         });
       } else {
         alert('请安装 MetaMask!');
       }
     } catch (error) {
       console.error('连接钱包错误:', error);
+      setStatusMessage('连接钱包失败，请重试');
     }
   };
 
   // 切换网络
-  const switchNetwork = async (chainId: number, chainConfig: typeof SUPPORTED_CHAINS[keyof typeof SUPPORTED_CHAINS]) => {
+  const switchNetwork = async (chainId: number, chainConfig: ChainConfig) => {
+    if (!window.ethereum) {
+      throw new Error("MetaMask未安装");
+    }
+
     try {
-      // 将 chainId 转换为十六进制，但不添加前导零
       const hexChainId = `0x${chainId.toString(16)}`;
-      console.log('Switching to network:', { chainId, hexChainId, chainConfig });
+      console.log('切换到网络:', { chainId, hexChainId, chainConfig });
       
-      await window.ethereum?.request({
+      await window.ethereum.request({
         method: 'wallet_switchEthereumChain',
         params: [{ chainId: hexChainId }],
       });
     } catch (error: any) {
-      console.log('Switch network error:', error);
+      console.log('切换网络错误:', error);
+      
       if (error.code === 4902) {
         // 如果网络不存在，添加网络
         try {
@@ -188,27 +230,32 @@ const BridgeComponent = () => {
           });
         } catch (addError) {
           console.error('添加网络错误:', addError);
-          alert('请手动在 MetaMask 中添加目标网络');
+          throw new Error('无法添加网络，请手动在 MetaMask 中添加');
         }
+      } else {
+        throw error;
       }
-      throw error;
     }
+  };
+
+  // 准备跨链传输的地址格式
+  const prepareRecipientAddress = (address: string): string => {
+    // 使用钱包地址的哈希作为bytes32格式的接收地址
+    const addressBytes = ethers.utils.arrayify(ethers.utils.id(address));
+    return ethers.utils.hexlify(addressBytes);
   };
 
   // 执行跨链转账
   const performBridgeTransfer = async () => {
-    if (!sourceChain || !targetChain || !amount || !wallet) {
-      setTransferStatus("请选择源链、目标链、金额并连接钱包");
+    if (!sourceChain || !targetChain || !amount || !wallet || !srcChainConfig || !dstChainConfig) {
+      setStatusMessage("请选择源链、目标链、金额并连接钱包");
       return;
     }
 
     try {
-      setTransferStatus("发起跨链转账...");
-
-      // 获取源链和目标链配置
-      const srcChainConfig = SUPPORTED_CHAINS[sourceChain as keyof typeof SUPPORTED_CHAINS];
-      const dstChainConfig = SUPPORTED_CHAINS[targetChain as keyof typeof SUPPORTED_CHAINS];
-      console.log('Chain configs:', { srcChainConfig, dstChainConfig });
+      setStatus("preparing");
+      setStatusMessage("准备跨链转账...");
+      setTxHash("");
 
       if (!wallet.provider) {
         throw new Error("钱包 provider 未找到");
@@ -216,31 +263,39 @@ const BridgeComponent = () => {
 
       // 检查钱包是否连接到正确的网络
       const network = await wallet.provider.getNetwork();
-      console.log('Current network:', network);
+      console.log('当前网络:', network);
 
       if (network.chainId !== srcChainConfig.chainId) {
+        setStatusMessage(`切换到 ${srcChainConfig.name} 网络...`);
         await switchNetwork(srcChainConfig.chainId, srcChainConfig);
+        
+        // 网络切换后重新获取provider
+        const newProvider = new ethers.providers.Web3Provider(window.ethereum as any);
+        const newSigner = newProvider.getSigner();
+        setWallet(newSigner);
       }
 
       // 获取当前gas价格
       const gasPrice = await wallet.provider.getGasPrice();
-      console.log('Current gas price:', ethers.utils.formatUnits(gasPrice, 'gwei'), 'gwei');
+      console.log('当前gas价格:', ethers.utils.formatUnits(gasPrice, 'gwei'), 'gwei');
 
-      // 获取钱包地址
-      const walletAddress = await wallet.getAddress();
+      // 获取钱包地址（如果还没有获取）
+      const address = walletAddress || await wallet.getAddress();
+      if (!walletAddress) {
+        setWalletAddress(address);
+      }
 
       // 检查ETH余额
-      const ethBalance = await wallet.provider.getBalance(walletAddress);
-      console.log('ETH balance:', ethers.utils.formatEther(ethBalance));
+      const ethBalance = await wallet.provider.getBalance(address);
+      console.log('ETH余额:', ethers.utils.formatEther(ethBalance));
 
-      if (ethBalance.lt(ethers.utils.parseEther('0.005'))) {
-        throw new Error(`ETH 余额不足，至少需要 0.005 ${srcChainConfig.nativeCurrency.name}。当前余额: ${ethers.utils.formatEther(ethBalance)}`);
+      const requiredEth = ethers.utils.parseEther(CROSS_CHAIN_CONSTANTS.FEE);
+      if (ethBalance.lt(requiredEth)) {
+        throw new Error(`${srcChainConfig.nativeCurrency.symbol} 余额不足，至少需要 ${CROSS_CHAIN_CONSTANTS.FEE} ${srcChainConfig.nativeCurrency.symbol}。当前余额: ${ethers.utils.formatEther(ethBalance)}`);
       }
 
       // 检查合约代码
       const nttManagerCode = await wallet.provider.getCode(srcChainConfig.nttManager);
-      console.log('Contract code length:', nttManagerCode.length);
-
       if (nttManagerCode.length <= 2) {
         throw new Error(`NTT Manager 合约地址无效: ${srcChainConfig.nttManager}`);
       }
@@ -259,154 +314,169 @@ const BridgeComponent = () => {
         console.warn('无法检查合约初始化状态，继续执行:', error);
       }
 
-      // 创建USDC合约实例
-      const usdcAbi = [
-        "function balanceOf(address) view returns (uint256)",
-        "function decimals() view returns (uint8)",
-        "function allowance(address, address) view returns (uint256)",
-        "function approve(address, uint256) returns (boolean)"
-      ];
+      // 创建CCT合约实例
+      const cctContract = new ethers.Contract(srcChainConfig.cctAddress, CCT_ABI, wallet);
       
-      const usdcContract = new ethers.Contract(srcChainConfig.usdcAddress, usdcAbi, wallet);
-      
-      // 获取USDC代币精度
-      const decimals = await usdcContract.decimals();
-      console.log('USDC decimals:', decimals);
-      
-      // 获取合约代币精度 (可能与USDC不同)
-      const tokenDecimals = decimals;
-      console.log('Contract token decimals:', tokenDecimals);
+      // 获取CCT代币精度
+      const decimals = await cctContract.decimals();
+      console.log('CCT精度:', decimals);
       
       // 将输入金额转换为wei单位
-      const amountWei = ethers.utils.parseUnits(amount, tokenDecimals);
-      console.log('Transfer amount:', ethers.utils.formatUnits(amountWei, tokenDecimals));
+      const amountWei = ethers.utils.parseUnits(amount, decimals);
+      console.log('转账金额:', ethers.utils.formatUnits(amountWei, decimals));
       
-      // 检查USDC余额
-      const usdcBalance = await usdcContract.balanceOf(walletAddress);
-      console.log('USDC balance:', ethers.utils.formatUnits(usdcBalance, tokenDecimals));
+      // 检查CCT余额
+      const cctBalance = await cctContract.balanceOf(address);
+      console.log('CCT余额:', ethers.utils.formatUnits(cctBalance, decimals));
       
-      if (usdcBalance.lt(amountWei)) {
-        throw new Error(`USDC 余额不足。当前余额: ${ethers.utils.formatUnits(usdcBalance, tokenDecimals)} USDC`);
+      if (cctBalance.lt(amountWei)) {
+        throw new Error(`CCT 余额不足。当前余额: ${ethers.utils.formatUnits(cctBalance, decimals)} CCT`);
       }
       
-      // 检查USDC是否已授权给NTT Manager
-      const currentAllowance = await usdcContract.allowance(walletAddress, srcChainConfig.nttManager);
-      console.log('Current allowance:', ethers.utils.formatUnits(currentAllowance, tokenDecimals));
+      // 检查CCT是否已授权给NTT Manager
+      const currentAllowance = await cctContract.allowance(address, srcChainConfig.nttManager);
+      console.log('当前授权额度:', ethers.utils.formatUnits(currentAllowance, decimals));
       
       if (currentAllowance.lt(amountWei)) {
-        setTransferStatus(`授权 USDC 代币给 NTT Manager...`);
-        const approveTx = await usdcContract.approve(srcChainConfig.nttManager, amountWei);
+        setStatus("approving");
+        setStatusMessage(`授权 CCT 代币给 NTT Manager...`);
+        
+        const approveTx = await cctContract.approve(srcChainConfig.nttManager, amountWei);
+        setTxHash(approveTx.hash);
+        setStatusMessage(`授权交易已发送。交易哈希: ${approveTx.hash}`);
+        
         await approveTx.wait();
-        console.log('USDC approved');
+        console.log('CCT授权成功');
       }
 
-      // 获取当前地址的类型和格式
-      console.log('原始钱包地址:', walletAddress);
+      // 准备接收者地址
+      const bytes32Recipient = prepareRecipientAddress(address);
+      console.log('接收者地址 (bytes32):', bytes32Recipient);
       
-      // Wormhole接收者地址格式 - 完全匹配成功交易的格式
-      // 我们不再使用000000000000000000000000前缀
-      // 注意：需要使用钱包在目标链上的地址，这里用相同地址作为示例
-      
-      // 构造一个随机的bytes32地址作为测试
-      // 在实际使用中，这应该是根据跨链协议要求生成的
-      // 这里使用一个简单的哈希函数模拟
-      const addressBytes = ethers.utils.arrayify(ethers.utils.id(walletAddress));
-      const bytes32Recipient = ethers.utils.hexlify(addressBytes);
-      
-      console.log('构造的bytes32接收者地址:', bytes32Recipient);
-      
-      // 创建目标链Wormhole ID的映射
-      const wormholeChainIdMap: Record<string, number> = {
-        // Mainnet
-        ethereum: 2,    // Ethereum
-        bsc: 4,         // BNB Smart Chain
-        avalanche: 6,   // Avalanche
-        polygon: 5,     // Polygon
-        arbitrum: 23,   // Arbitrum
-        optimism: 24,   // Optimism
-        base: 30,       // Base
-
-        // Testnet - 使用同样的映射，但具体值根据测试网络可能有所不同
-        "Ethereum Sepolia": 10002,  // Ethereum Sepolia
-        "BSC Testnet": 4,          // BSC Testnet
-        "Arbitrum Sepolia": 10003,  // Arbitrum Sepolia
-      };
-
-      // 根据目标链名称获取正确的Wormhole链ID
-      // 使用目标链名称或默认为当前设置的链ID
-      const destinationWormholeChainId = wormholeChainIdMap[dstChainConfig.name] || dstChainConfig.wormholeChainId;
+      // 获取正确的Wormhole链ID
+      const destinationWormholeChainId = WORMHOLE_CHAIN_ID_MAP[dstChainConfig.name] || dstChainConfig.wormholeChainId;
       console.log(`目标链 ${dstChainConfig.name} 的Wormhole链ID: ${destinationWormholeChainId}`);
 
-      // 发送交易
+      // 创建NTT Manager合约实例
+      const nttManagerContract = new ethers.Contract(srcChainConfig.nttManager, NTT_MANAGER_ABI, wallet);
+
+      // 准备传输指令数据
+      const instructionBytes = new Uint8Array([0x01, 0x00, 0x01, 0x01]);
+      const transceiverInstructions = ethers.utils.hexlify(instructionBytes);
+
+      // 发送跨链转账交易
+      setStatus("transferring");
+      setStatusMessage("发送跨链转账交易...");
+      
       const transferTx = await retryOperation(async () => {
-        // 手动构造完全匹配的交易数据
-        const manualCallData = '0xb293f97f' + 
-          // 去掉0x前缀的amountWei，补齐到64位
-          amountWei.toHexString().replace(/^0x/, '').padStart(64, '0') +
-          // 使用正确的Wormhole目标链ID，补齐到64位
-          destinationWormholeChainId.toString(16).padStart(64, '0') +
-          // 接收者地址 - 使用bytes32格式，去掉0x前缀
-          bytes32Recipient.replace(/^0x/, '') +
-          // 退款地址 - 同上
-          bytes32Recipient.replace(/^0x/, '') +
-          // shouldQueue参数(false)，补齐到64位
-          '0'.padStart(64, '0') +
-          // bytes参数位置指针，固定为0xc0
-          'c0'.padStart(64, '0') +
-          // bytes长度，固定为4
-          '4'.padStart(64, '0') +
-          // bytes内容 - 01000101，后面补0
-          '01000101' + '0'.repeat(56);
-        
-        console.log('手动构造的交易数据:', manualCallData);
-        
-        return wallet.sendTransaction({
-          to: srcChainConfig.nttManager,
-          data: manualCallData,
-          value: ethers.utils.parseEther("0.005"), // 跨链费用
-          gasLimit: 900000                         // gas限制
-        });
+        // 使用合约接口发送交易，而不是手动构建数据
+        return nttManagerContract.transfer(
+          amountWei,                      // amount
+          destinationWormholeChainId,     // recipientChain
+          bytes32Recipient,               // recipient
+          bytes32Recipient,               // refundAddress (与接收者相同)
+          false,                          // shouldQueue
+          transceiverInstructions,        // transceiverInstructions
+          {
+            value: ethers.utils.parseEther(CROSS_CHAIN_CONSTANTS.FEE),
+            gasLimit: CROSS_CHAIN_CONSTANTS.GAS_LIMIT
+          }
+        );
       });
 
+      setTxHash(transferTx.hash);
       console.log('交易已发送，等待确认. Hash:', transferTx.hash);
-      setTransferStatus(`交易已发送，等待确认。\n交易哈希: ${transferTx.hash}\n\n可以在区块浏览器查看：${srcChainConfig.explorer}/tx/${transferTx.hash}`);
+      setStatus("confirming");
+      setStatusMessage(`交易已发送，等待确认。\n交易哈希: ${transferTx.hash}`);
 
       // 等待交易确认
       const receipt = await transferTx.wait();
       console.log('交易已确认:', receipt);
 
       if (receipt.status === 1) {
-        setTransferStatus(`跨链转账成功！\n\n交易哈希: ${transferTx.hash}\n\n请在目标链 ${dstChainConfig.name} 查看你的余额。`);
+        setStatus("success");
+        setStatusMessage(`跨链转账成功！请在目标链 ${dstChainConfig.name} 查看你的余额。`);
       } else {
-        setTransferStatus(`跨链转账失败。\n\n交易哈希: ${transferTx.hash}`);
+        setStatus("error");
+        setStatusMessage(`跨链转账失败。请检查交易详情。`);
       }
-      console.log("Bridge transfer completed!");
 
     } catch (error: any) {
       console.error("跨链转账错误:", error);
-      setTransferStatus(`错误: ${error.message || "未知错误"}`);
+      setStatus("error");
+      setStatusMessage(`错误: ${error.message || "未知错误"}`);
     }
   };
 
+  // 获取状态类样式
+  const getStatusClass = () => {
+    switch (status) {
+      case "preparing":
+      case "approving":
+      case "transferring":
+      case "confirming":
+        return "bg-blue-100 text-blue-800";
+      case "success":
+        return "bg-green-100 text-green-800";
+      case "error":
+        return "bg-red-100 text-red-800";
+      default:
+        return "";
+    }
+  };
+
+  // 渲染交易状态
+  const renderTransactionStatus = () => {
+    if (status === "idle") return null;
+    
+    return (
+      <div className={`p-4 rounded ${getStatusClass()}`}>
+        <div className="font-bold">{status.charAt(0).toUpperCase() + status.slice(1)}</div>
+        <div className="whitespace-pre-line">{statusMessage}</div>
+        {txHash && (
+          <div className="mt-2">
+            <a 
+              href={`${srcChainConfig?.explorer}/tx/${txHash}`} 
+              target="_blank" 
+              rel="noopener noreferrer"
+              className="text-blue-600 hover:underline"
+            >
+              在区块浏览器查看交易 ↗
+            </a>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // 是否禁用转账按钮
+  const isTransferDisabled = !sourceChain || !targetChain || !amount || !wallet || 
+    status === "preparing" || status === "approving" || status === "transferring" || status === "confirming";
+
   return (
-    <div className="p-4">
+    <div className="p-4 max-w-lg mx-auto">
       <h1 className="text-2xl font-bold mb-4">Wormhole 跨链桥 (测试网)</h1>
       
       {!wallet ? (
         <button
           onClick={connectWallet}
-          className="bg-blue-500 text-white px-4 py-2 rounded"
+          className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded w-full transition"
         >
           连接钱包
         </button>
       ) : (
         <div className="space-y-4">
+          <div className="p-3 bg-gray-100 rounded mb-4 text-sm">
+            已连接钱包: {walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}
+          </div>
+          
           <div>
-            <label className="block mb-2">源链:</label>
+            <label className="block mb-2 font-medium">源链:</label>
             <select
               value={sourceChain}
               onChange={(e) => setSourceChain(e.target.value)}
-              className="border p-2 rounded w-full"
+              className="border p-2 rounded w-full bg-white"
+              disabled={status !== "idle" && status !== "error" && status !== "success"}
             >
               <option value="">选择链</option>
               {Object.keys(SUPPORTED_CHAINS).map((name) => (
@@ -418,15 +488,16 @@ const BridgeComponent = () => {
           </div>
 
           <div>
-            <label className="block mb-2">目标链:</label>
+            <label className="block mb-2 font-medium">目标链:</label>
             <select
               value={targetChain}
               onChange={(e) => setTargetChain(e.target.value)}
-              className="border p-2 rounded w-full"
+              className="border p-2 rounded w-full bg-white"
+              disabled={status !== "idle" && status !== "error" && status !== "success"}
             >
               <option value="">选择链</option>
               {Object.keys(SUPPORTED_CHAINS).map((name) => (
-                <option key={name} value={name}>
+                <option key={name} value={name} disabled={name === sourceChain}>
                   {name}
                 </option>
               ))}
@@ -434,46 +505,42 @@ const BridgeComponent = () => {
           </div>
 
           <div>
-            <label className="block mb-2">金额 (USDC):</label>
+            <label className="block mb-2 font-medium">金额 (CCT):</label>
             <input
               type="number"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               className="border p-2 rounded w-full"
-              placeholder="输入 USDC 金额"
+              placeholder="输入 CCT 金额"
               step="0.000001"
               min="0"
+              disabled={status !== "idle" && status !== "error" && status !== "success"}
             />
           </div>
 
-          {transferStatus && (
-            <div className="bg-blue-100 text-blue-800 p-4 rounded">
-              {transferStatus}
-            </div>
-          )}
+          {renderTransactionStatus()}
 
           <button
             onClick={performBridgeTransfer}
-            disabled={loading}
-            className="bg-green-500 text-white px-4 py-2 rounded w-full disabled:bg-gray-400"
+            disabled={isTransferDisabled}
+            className={`px-4 py-2 rounded w-full transition ${
+              isTransferDisabled
+                ? "bg-gray-400 text-gray-200 cursor-not-allowed"
+                : "bg-green-500 hover:bg-green-600 text-white"
+            }`}
           >
-            {loading ? '处理中...' : '执行跨链转账'}
+            {status === "preparing" || status === "approving" || status === "transferring" || status === "confirming"
+              ? "处理中..."
+              : "执行跨链转账"}
           </button>
           
-          <div className="text-sm text-gray-500 mt-4">
-            注意：
-            <ul className="list-disc pl-5 mt-2">
+          <div className="text-sm text-gray-600 mt-4 bg-gray-50 p-3 rounded">
+            <h3 className="font-medium mb-2">说明:</h3>
+            <ul className="list-disc pl-5 space-y-1">
               <li>当前使用的是测试网络</li>
-              <li>需要确保钱包中有足够的测试网 ETH 支付 gas 费用</li>
-              <li>可以从水龙头获取测试网代币：
-                <ul className="list-disc pl-5 mt-1">
-                  <li><a href="https://goerlifaucet.com/" target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">Goerli 测试网</a></li>
-                  <li><a href="https://testnet.bnbchain.org/faucet-smart" target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">BSC 测试网</a></li>
-                  <li><a href="https://faucet.polygon.technology/" target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">Mumbai 测试网</a></li>
-                  <li><a href="https://faucet.avax.network/" target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">Fuji 测试网</a></li>
-                </ul>
-              </li>
-              <li>跨链转账需要等待5-15分钟完成确认</li>
+              <li>需要确保钱包中有足够的测试网代币支付 gas 费用</li>
+              <li>跨链转账需要支付 {CROSS_CHAIN_CONSTANTS.FEE} ETH 的跨链费用</li>
+              <li>跨链转账完成大约需要 5-15 分钟</li>
             </ul>
           </div>
         </div>
