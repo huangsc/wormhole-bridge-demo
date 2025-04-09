@@ -74,7 +74,7 @@ const SUPPORTED_CHAINS = {
   }
 } as const;
 
-// Wormhole链ID映射 - 根据官方文档
+// Wormhole链ID映射 - 根据官方文档（https://wormhole.com/docs/build/reference/chain-ids/#__tabbed_1_2
 const WORMHOLE_CHAIN_ID_MAP: Record<string, number> = {
   "Ethereum": 2,
   "Solana": 1,
@@ -93,9 +93,7 @@ const WORMHOLE_CHAIN_ID_MAP: Record<string, number> = {
 const CROSS_CHAIN_CONSTANTS = {
   FEE: "0.005", // 跨链费用 (ETH)
   GAS_LIMIT: 900000, // Gas限制
-  FUNCTION_SELECTOR: "0xb293f97f", // transfer函数选择器
   TX_RETRY_COUNT: 3, // 重试次数
-  TX_TIMEOUT: 30000, // 超时时间(ms)
 };
 
 declare global {
