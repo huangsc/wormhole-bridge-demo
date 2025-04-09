@@ -362,16 +362,16 @@ const BridgeComponent = () => {
       // 创建NTT Manager合约实例
       const nttManagerContract = new ethers.Contract(srcChainConfig.nttManager, NTT_MANAGER_ABI, wallet);
 
-      // 准备传输指令数据
-      const instructionBytes = new Uint8Array([0x01, 0x00, 0x01, 0x01]);
-      const transceiverInstructions = ethers.utils.hexlify(instructionBytes);
+      const transceiverInstructions = "0x01000100";
+      
+      console.log('使用的transceiverInstructions:', transceiverInstructions);
+      console.log('字节长度:', ethers.utils.arrayify(transceiverInstructions).length);
 
       // 发送跨链转账交易
       setStatus("transferring");
       setStatusMessage("发送跨链转账交易...");
       
       const transferTx = await retryOperation(async () => {
-        // 使用合约接口发送交易，而不是手动构建数据
         return nttManagerContract.transfer(
           amountWei,                      // amount
           destinationWormholeChainId,     // recipientChain
