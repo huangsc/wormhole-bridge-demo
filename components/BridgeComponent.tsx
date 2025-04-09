@@ -238,9 +238,10 @@ const BridgeComponent = () => {
 
   // 准备跨链传输的地址格式
   const prepareRecipientAddress = (address: string): string => {
-    // 使用钱包地址的哈希作为bytes32格式的接收地址
-    const addressBytes = ethers.utils.arrayify(ethers.utils.id(address));
-    return ethers.utils.hexlify(addressBytes);
+    // 使用直接填充格式，而不是哈希方法
+    // 移除0x前缀，然后添加适当的前导零填充
+    const cleanAddress = address.replace(/^0x/, '').toLowerCase();
+    return '0x000000000000000000000000' + cleanAddress;
   };
 
   // 执行跨链转账
@@ -351,9 +352,12 @@ const BridgeComponent = () => {
       const bytes32Recipient = prepareRecipientAddress(address);
       console.log('接收者地址 (bytes32):', bytes32Recipient);
       
-      // 获取正确的Wormhole链ID
+      // 获取正确的Wormhole链ID，测试网环境下确保使用测试网ID
+      // BSC Testnet -> Arbitrum Sepolia: 10003
+      // Arbitrum Sepolia -> BSC Testnet: 4
       const destinationWormholeChainId = WORMHOLE_CHAIN_ID_MAP[dstChainConfig.name] || dstChainConfig.wormholeChainId;
       console.log(`目标链 ${dstChainConfig.name} 的Wormhole链ID: ${destinationWormholeChainId}`);
+      console.log(`注意: Arbitrum Sepolia的测试网ID是10003，BSC Testnet的ID是4`);
 
       // 创建NTT Manager合约实例
       const nttManagerContract = new ethers.Contract(srcChainConfig.nttManager, NTT_MANAGER_ABI, wallet);
@@ -453,7 +457,7 @@ const BridgeComponent = () => {
 
   return (
     <div className="p-4 max-w-lg mx-auto">
-      <h1 className="text-2xl font-bold mb-4">Wormhole 跨链桥 (测试网)</h1>
+      <h1 className="text-2xl font-bold mb-4">Wormhole 跨链桥</h1>
       
       {!wallet ? (
         <button
